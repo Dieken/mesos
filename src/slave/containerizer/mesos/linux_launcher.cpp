@@ -19,6 +19,8 @@
 
 #include <linux/sched.h>
 
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include <process/collect.hpp>
@@ -42,6 +44,7 @@
 
 using namespace process;
 
+using std::ifstream;
 using std::list;
 using std::map;
 using std::set;
@@ -68,10 +71,12 @@ static ContainerID container(const string& cgroup)
 LinuxLauncher::LinuxLauncher(
     const Flags& _flags,
     const string& _freezerHierarchy,
-    const Option<string>& _systemdHierarchy)
+    const Option<string>& _systemdHierarchy,
+    const string& _systemdMesosExecutorsCgroup)
   : flags(_flags),
     freezerHierarchy(_freezerHierarchy),
-    systemdHierarchy(_systemdHierarchy) {}
+    systemdHierarchy(_systemdHierarchy),
+    systemdMesosExecutorsCgroup(_systemdMesosExecutorsCgroup) {}
 
 
 Try<Launcher*> LinuxLauncher::create(const Flags& flags)
@@ -112,6 +117,7 @@ Try<Launcher*> LinuxLauncher::create(const Flags& flags)
   // `SYSTEMD_MESOS_EXECUTORS_SLICE` exists and is running.
   // TODO(jmlvanre): Prevent racing between multiple agents for this creation
   // logic.
+  string systemdMesosExecutorsCgroup;
   if (systemd::exists()) {
     systemd::Flags systemdFlags;
     systemdFlags.runtime_directory = flags.systemd_runtime_directory;
@@ -154,12 +160,28 @@ Try<Launcher*> LinuxLauncher::create(const Flags& flags)
                    "': " + start.error());
     }
 
+    string systemdCgroupRoot;
+    string line;
+    ifstream in("/proc/1/cgroup");
+
+    while (std::getline(in, line)) {
+      vector<string> fields = strings::tokenize(line, ":");
+      if (fields.size() >= 3 && fields[1] == "name=systemd") {
+        systemdCgroupRoot = fields[2];
+        break;
+      }
+    }
+    in.close();
+
+    systemdMesosExecutorsCgroup =
+        path::join(systemdCgroupRoot, SYSTEMD_MESOS_EXECUTORS_SLICE);
+
     // Now the `SYSTEMD_MESOS_EXECUTORS_SLICE` is ready for us to assign any
     // executors. We can verify that our cgroups assignments will work by
     // testing the hierarchy.
     Try<bool> exists = cgroups::exists(
         systemd::hierarchy(),
-        SYSTEMD_MESOS_EXECUTORS_SLICE);
+        systemdMesosExecutorsCgroup);
 
     if (exists.isError() || !exists.get()) {
       return Error("Failed to locate systemd cgroups hierarchy: " +
@@ -172,7 +194,8 @@ Try<Launcher*> LinuxLauncher::create(const Flags& flags)
       freezerHierarchy.get(),
       systemd::exists() ?
         Some(systemd::hierarchy()) :
-        Option<std::string>::none());
+        Option<std::string>::none(),
+      systemdMesosExecutorsCgroup);
 }
 
 
@@ -199,14 +222,14 @@ Future<hashset<ContainerID>> LinuxLauncher::recover(
   Result<std::set<pid_t>> mesosExecutorSlicePids = None();
   if (systemdHierarchy.isSome()) {
     mesosExecutorSlicePids =
-      cgroups::processes(systemdHierarchy.get(), SYSTEMD_MESOS_EXECUTORS_SLICE);
+      cgroups::processes(systemdHierarchy.get(), systemdMesosExecutorsCgroup);
 
     // If we error out trying to read the pids from the
     // `SYSTEMD_MESOS_EXECUTORS_SLICE` we fail. This is a programmer error as we
     // did not set up the slice correctly.
     if (mesosExecutorSlicePids.isError()) {
       return Failure("Failed to read pids from systemd '" +
-                     stringify(SYSTEMD_MESOS_EXECUTORS_SLICE) + "'");
+                     systemdMesosExecutorsCgroup + "'");
     }
   }
 
@@ -255,7 +278,7 @@ Future<hashset<ContainerID>> LinuxLauncher::recover(
       if (mesosExecutorSlicePids.get().count(pid) <= 0) {
         LOG(WARNING)
           << "Couldn't find pid '" << pid << "' in '"
-          << SYSTEMD_MESOS_EXECUTORS_SLICE << "'. This can lead to lack of"
+          << systemdMesosExecutorsCgroup << "'. This can lead to lack of"
           << " proper resource isolation";
       }
     }
@@ -405,7 +428,7 @@ Try<pid_t> LinuxLauncher::fork(
   if (systemdHierarchy.isSome()) {
     Try<Nothing> assign = cgroups::assign(
         systemdHierarchy.get(),
-        SYSTEMD_MESOS_EXECUTORS_SLICE,
+        systemdMesosExecutorsCgroup,
         child.get().pid());
 
     if (assign.isError()) {
@@ -418,7 +441,7 @@ Try<pid_t> LinuxLauncher::fork(
     }
 
     LOG(INFO) << "Assigned child process '" << child.get().pid() << "' to '"
-              << SYSTEMD_MESOS_EXECUTORS_SLICE << "'";
+              << systemdMesosExecutorsCgroup << "'";
   }
 
   // Now that we've contained the child we can signal it to continue
